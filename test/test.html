@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <title>TFJS 모델 평가 (브라우저, 보정 포함)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, "Noto Sans KR",
+          Arial, sans-serif;
+        line-height: 1.4;
+        padding: 24px;
+      }
+      h1 {
+        margin: 0 0 16px;
+      }
+      .row {
+        margin: 14px 0;
+      }
+      .btn {
+        padding: 10px 14px;
+        border-radius: 8px;
+        border: 1px solid #ccc;
+        background: #0d6efd;
+        color: #fff;
+        cursor: pointer;
+      }
+      .box {
+        background: #f7f7f8;
+        border: 1px solid #e5e7eb;
+        padding: 12px;
+        border-radius: 8px;
+        white-space: pre-wrap;
+      }
+      table {
+        border-collapse: collapse;
+        margin-top: 8px;
+      }
+      td,
+      th {
+        border: 1px solid #ddd;
+        padding: 6px 8px;
+        text-align: center;
+      }
+      .grid {
+        display: grid;
+        gap: 12px;
+        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      }
+      .muted {
+        color: #6b7280;
+      }
+      .ok {
+        color: #059669;
+        font-weight: 600;
+      }
+      .err {
+        color: #dc2626;
+        font-weight: 600;
+      }
+      canvas {
+        max-width: 100%;
+      }
+      .small {
+        font-size: 12px;
+        color: #6b7280;
+      }
+      .row input[type="number"] {
+        width: 80px;
+        padding: 6px 8px;
+        margin-left: 6px;
+      }
+      .pill {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 999px;
+        border: 1px solid #e5e7eb;
+        background: #fff;
+        margin-right: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>TFJS 모델 평가 (브라우저, 보정 포함)</h1>
+
+    <div class="row">
+      <b>① 모델 폴더 선택</b> (model.json, weights.bin, metadata.json 포함)
+    </div>
+    <input id="inModel" type="file" webkitdirectory multiple />
+
+    <div class="row">
+      <b>② 데이터셋 폴더 선택</b> (서브폴더 OK / 단일폴더 OK)
+    </div>
+    <input id="inData" type="file" webkitdirectory multiple accept="image/*" />
+
+    <div class="row">
+      <button id="btnRun" class="btn">평가 시작</button>
+      <span class="pill"
+        >δ(계란형 logit 편향):
+        <input id="biasEgg" type="number" step="0.1" value="-1.0"
+      /></span>
+      <span class="pill"
+        >T(온도): <input id="temp" type="number" step="0.1" value="1.0"
+      /></span>
+      <span class="pill"
+        >τ(Top-2 마진): <input id="tau" type="number" step="0.01" value="0.08"
+      /></span>
+    </div>
+
+    <div id="log" class="box" style="min-height: 110px"></div>
+
+    <div id="summary"></div>
+    <div class="grid">
+      <div>
+        <h3>혼동행렬 <span class="muted">(보정 후)</span></h3>
+        <div id="cm"></div>
+      </div>
+      <div>
+        <h3>클래스별 지표 <span class="muted">(보정 후)</span></h3>
+        <div id="perclass"></div>
+      </div>
+    </div>
+
+    <p class="small">
+      * 보정 내용: (i) 원본+좌우반전 TTA 평균, (ii) 혼동행렬 기반 계란형(logit)
+      오프셋 δ, (iii) Top-2 마진(τ) 스위치, (iv) 온도 스케일링(T).
+    </p>
+
+    <script>
+      const $ = (s) => document.querySelector(s);
+      const logBox = $("#log");
+      function log(...a) {
+        logBox.textContent += a.join(" ") + "\n";
+        logBox.scrollTop = logBox.scrollHeight;
+      }
+      function clearLog() {
+        logBox.textContent = "";
+      }
+      function downloadText(filename, text) {
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(
+          new Blob([text], { type: "application/json" })
+        );
+        a.download = filename;
+        a.click();
+        URL.revokeObjectURL(a.href);
+      }
+      function norm(s) {
+        return String(s || "")
+          .toLowerCase()
+          .replace(/\.[^/.]+$/, "") // 확장자 제거
+          .replace(/[0-9]+/g, "") // 숫자 제거(옵션)
+          .replace(/[\s_\-]+/g, ""); // 공백/밑줄/하이픈 제거
+      }
+
+      // ---------- 라벨 동의어(파일/폴더명에서 추론) ----------
+      function buildSynonyms(labels) {
+        const syn = {};
+        for (const L of labels) {
+          const n = norm(L);
+          syn[L] = [L];
+          if (n.includes("둥근") || n.includes("원형")) {
+            syn[L].push(
+              "둥근",
+              "원형",
+              "라운드",
+              "round",
+              "realround",
+              "circle"
+            );
+          } else if (n.includes("긴")) {
+            syn[L].push("긴", "롱", "길쭉", "long", "longface");
+          } else if (n.includes("각진") || n.includes("사각")) {
+            syn[L].push(
+              "각진",
+              "사각",
+              "스퀘어",
+              "angular",
+              "square",
+              "rectangle"
+            );
+          } else if (n.includes("계란") || n.includes("타원")) {
+            syn[L].push("계란", "타원", "oval", "egg", "ellipse");
+          } else if (n.includes("다이아")) {
+            syn[L].push("다이아", "마름모", "diamond");
+          }
+        }
+        for (const k of Object.keys(syn)) syn[k] = syn[k].map(norm);
+        return syn;
+      }
+      function buildTokenIndex(labels) {
+        const syn = buildSynonyms(labels);
+        const idxByLabel = Object.fromEntries(labels.map((L, i) => [L, i]));
+        const tokens = [];
+        for (const L of labels)
+          for (const t of syn[L])
+            if (t) tokens.push({ tok: t, idx: idxByLabel[L] });
+        tokens.sort((a, b) => b.tok.length - a.tok.length); // 긴 토큰 우선
+        return tokens;
+      }
+      function findIdxByName(name, tokenIndex) {
+        const s = norm(name);
+        for (const { tok, idx } of tokenIndex)
+          if (tok && s.includes(tok)) return idx;
+        return -1;
+      }
+      function findEggIndex(labels) {
+        const keys = ["계란", "타원", "oval", "egg"];
+        const n = (s) =>
+          String(s || "")
+            .toLowerCase()
+            .replace(/\s/g, "");
+        for (let i = 0; i < labels.length; i++) {
+          const L = n(labels[i]);
+          if (keys.some((k) => L.includes(k))) return i;
+        }
+        return -1;
+      }
+
+      // ---------- 모델/메타 로딩 ----------
+      async function loadModelAndMeta(modelFiles) {
+        const list = Array.from(modelFiles || []);
+        const fByName = Object.fromEntries(
+          list.map((f) => [f.name.toLowerCase(), f])
+        );
+        const modelJson = fByName["model.json"];
+        const weights = fByName["weights.bin"];
+        const meta = fByName["metadata.json"];
+        if (!modelJson || !weights || !meta)
+          throw new Error(
+            "model.json / weights.bin / metadata.json 을 모두 가진 폴더를 선택하세요."
+          );
+
+        const metaJson = JSON.parse(await meta.text());
+        const labels = metaJson.labels || [];
+        const imageSize = metaJson.imageSize || 224;
+
+        let model = null,
+          kind = "graph";
+        try {
+          model = await tf.loadGraphModel(
+            tf.io.browserFiles([modelJson, weights])
+          );
+        } catch (_) {
+          kind = "layers";
+          model = await tf.loadLayersModel(
+            tf.io.browserFiles([modelJson, weights])
+          );
+        }
+        return { model, labels, imageSize, kind };
+      }
+
+      // ---------- 데이터셋 파일 나열 + 정답라벨 추정 ----------
+      function listImagesSmart(dataFiles, labels) {
+        const tokenIndex = buildTokenIndex(labels);
+        const files = Array.from(dataFiles || []);
+        const items = [];
+        const EXT = new Set(["jpg", "jpeg", "png", "bmp", "webp"]);
+
+        // 하위폴더명으로 라벨 추정
+        let usedSubfolders = false;
+        for (const f of files) {
+          const ext = (f.name.split(".").pop() || "").toLowerCase();
+          if (!EXT.has(ext)) continue;
+          const rel = f.webkitRelativePath || f.name;
+          const parts = rel.split("/");
+          const parent = parts.length > 1 ? parts[parts.length - 2] : "";
+          const idxByFolder = findIdxByName(parent, tokenIndex);
+          if (idxByFolder >= 0) {
+            usedSubfolders = true;
+            items.push({ file: f, yTrue: idxByFolder, rel });
+          }
+        }
+        if (usedSubfolders) return items;
+
+        // 단일폴더: 파일명으로 라벨 추정
+        for (const f of files) {
+          const ext = (f.name.split(".").pop() || "").toLowerCase();
+          if (!EXT.has(ext)) continue;
+          const idx = findIdxByName(f.name, tokenIndex);
+          if (idx >= 0) items.push({ file: f, yTrue: idx, rel: f.name });
+        }
+        return items;
+      }
+
+      // ---------- 이미지 → 텐서 ----------
+      async function fileToTensor(f, size) {
+        const bmp = await createImageBitmap(f);
+        const t = tf.tidy(() =>
+          tf.browser
+            .fromPixels(bmp)
+            .resizeBilinear([size, size])
+            .toFloat()
+            .div(255)
+            .expandDims(0)
+        );
+        bmp.close();
+        return t;
+      }
+
+      // ---------- 예측 헬퍼 ----------
+      async function predictProbs(model, t) {
+        const out = model.predict(t);
+        let tens = out;
+        if (Array.isArray(out)) tens = out[0];
+        const probs = tens.dataSync ? tens.dataSync() : await tens.data();
+        out.dispose?.();
+        return Array.from(probs);
+      }
+      function softmaxFromLogits(logits) {
+        const m = Math.max(...logits);
+        const exps = logits.map((v) => Math.exp(v - m));
+        const s = exps.reduce((a, b) => a + b, 0);
+        return exps.map((v) => v / s);
+      }
+      function top2Indices(arr) {
+        let max1 = -1,
+          max2 = -1,
+          i1 = -1,
+          i2 = -1;
+        for (let i = 0; i < arr.length; i++) {
+          const v = arr[i];
+          if (v > max1) {
+            max2 = max1;
+            i2 = i1;
+            max1 = v;
+            i1 = i;
+          } else if (v > max2) {
+            max2 = v;
+            i2 = i;
+          }
+        }
+        return [i1, i2, max1, max2];
+      }
+
+      // ---------- 지표 계산 ----------
+      function confusionToPerClass(conf) {
+        const n = conf.length;
+        const per = [];
+        for (let c = 0; c < n; c++) {
+          const tp = conf[c][c];
+          let colSum = 0,
+            rowSum = 0;
+          for (let r = 0; r < n; r++) {
+            colSum += conf[r][c];
+            rowSum += conf[c][r];
+          }
+          const fp = colSum - tp;
+          const fn = rowSum - tp;
+          const precision = tp + fp === 0 ? 0 : tp / (tp + fp);
+          const recall = tp + fn === 0 ? 0 : tp / (tp + fn);
+          const f1 =
+            precision + recall === 0
+              ? 0
+              : (2 * precision * recall) / (precision + recall);
+          per.push({ precision, recall, f1, support: rowSum });
+        }
+        return per;
+      }
+
+      function renderCM(div, labels, conf) {
+        const n = labels.length;
+        let html =
+          "<table><tr><th></th>" +
+          labels.map((l) => `<th>pred<br>${l}</th>`).join("") +
+          "</tr>";
+        for (let r = 0; r < n; r++) {
+          html +=
+            `<tr><th>true<br>${labels[r]}</th>` +
+            conf[r].map((v) => `<td>${v}</td>`).join("") +
+            "</tr>";
+        }
+        html += "</table>";
+        div.innerHTML = html;
+      }
+      function renderPerClass(div, labels, per) {
+        let html =
+          "<table><tr><th>라벨</th><th>Precision</th><th>Recall</th><th>F1</th><th>Support</th></tr>";
+        for (let i = 0; i < labels.length; i++) {
+          const m = per[i];
+          html += `<tr><td>${labels[i]}</td><td>${m.precision.toFixed(
+            3
+          )}</td><td>${m.recall.toFixed(3)}</td><td>${m.f1.toFixed(
+            3
+          )}</td><td>${m.support}</td></tr>`;
+        }
+        html += "</table>";
+        div.innerHTML = html;
+      }
+
+      // ---------- 메인 실행 ----------
+      $("#btnRun").onclick = async () => {
+        clearLog();
+        try {
+          const modelFiles = $("#inModel").files;
+          const dataFiles = $("#inData").files;
+
+          if (!modelFiles.length) {
+            log("[ERR] 모델 폴더를 먼저 선택하세요.");
+            return;
+          }
+          if (!dataFiles.length) {
+            log("[ERR] 데이터셋 폴더를 선택하세요.");
+            return;
+          }
+
+          log("[MODEL] 로딩 중…");
+          const { model, labels, imageSize, kind } = await loadModelAndMeta(
+            modelFiles
+          );
+          log("[MODEL] labels:", JSON.stringify(labels));
+          log(
+            "[MODEL] imageSize:",
+            imageSize,
+            "| 유형:",
+            kind === "graph" ? "GraphModel" : "LayersModel"
+          );
+
+          // 보정 파라미터
+          const eggIdx = findEggIndex(labels);
+          const biasEgg = parseFloat($("#biasEgg").value || "-1.0");
+          const TEMP = parseFloat($("#temp").value || "1.0");
+          const TAU = parseFloat($("#tau").value || "0.08");
+          const LOGIT_BIAS = new Array(labels.length).fill(0);
+          if (eggIdx >= 0) LOGIT_BIAS[eggIdx] = biasEgg;
+
+          const items = listImagesSmart(dataFiles, labels);
+          if (items.length === 0) {
+            log(
+              "[ERR] 평가할 이미지가 없습니다. 폴더/파일명에 라벨 단서를 넣어 주세요."
+            );
+            return;
+          }
+          log("[DATA] 이미지 개수:", items.length);
+
+          // 워밍업
+          const dummy = tf.zeros([1, imageSize, imageSize, 3]);
+          for (let i = 0; i < 3; i++) await model.predict(dummy).data();
+          dummy.dispose();
+
+          // 혼동행렬/측정치 (Raw & Adjusted)
+          const n = labels.length;
+          const confRaw = Array.from({ length: n }, () => Array(n).fill(0));
+          const confAdj = Array.from({ length: n }, () => Array(n).fill(0));
+          let correctRaw = 0,
+            correctAdj = 0;
+          const times = [];
+
+          // CSV
+          let csv =
+            "path,y_true,y_pred_raw,y_pred_adj,correct_adj,latency_ms\n";
+
+          for (let k = 0; k < items.length; k++) {
+            const { file, yTrue, rel } = items[k];
+            const t0 = performance.now();
+            const t = await fileToTensor(file, imageSize);
+
+            // TTA: 원본 + 좌우반전
+            const p1 = await predictProbs(model, t);
+            const tFlip = tf.image.flipLeftRight(t);
+            const p2 = await predictProbs(model, tFlip);
+            t.dispose();
+            tFlip.dispose();
+
+            const t1 = performance.now();
+            const ms = t1 - t0;
+            times.push(ms);
+
+            // 원시 확률(평균)
+            const probsRaw = p1.map((v, i) => (v + p2[i]) / 2);
+            const yPredRaw = probsRaw.indexOf(Math.max(...probsRaw));
+
+            // 보정: log-prob + bias + temp → softmax
+            const logitsAdj = probsRaw.map(
+              (p, i) => (Math.log(Math.max(p, 1e-9)) + LOGIT_BIAS[i]) / TEMP
+            );
+            const probsAdj = softmaxFromLogits(logitsAdj);
+
+            // Top-2 마진 스위치(계란형 과대예측 억제)
+            let [i1, i2, p1top, p2top] = top2Indices(probsAdj);
+            let yPredAdj = i1;
+            if (eggIdx >= 0 && i1 === eggIdx && p1top - p2top < TAU)
+              yPredAdj = i2;
+
+            // 집계
+            const okRaw = yPredRaw === yTrue ? 1 : 0;
+            const okAdj = yPredAdj === yTrue ? 1 : 0;
+            correctRaw += okRaw;
+            correctAdj += okAdj;
+            confRaw[yTrue][yPredRaw] += 1;
+            confAdj[yTrue][yPredAdj] += 1;
+
+            csv += `${(rel || file.name).replace(
+              /,/g,
+              "_"
+            )},${yTrue},${yPredRaw},${yPredAdj},${okAdj},${ms.toFixed(3)}\n`;
+
+            if ((k + 1) % 50 === 0) {
+              log(`[RUN] ${k + 1}/${items.length} 처리…`);
+              await tf.nextFrame();
+            }
+          }
+
+          const total = items.length;
+          const accRaw = correctRaw / total;
+          const accAdj = correctAdj / total;
+          const avgMs = times.reduce((a, b) => a + b, 0) / times.length;
+          const medMs = times.slice().sort((a, b) => a - b)[
+            Math.floor(times.length / 2)
+          ];
+
+          // per-class (보정 후)
+          const perAdj = confusionToPerClass(confAdj);
+
+          // 결과 표시
+          $("#summary").innerHTML = `
+            <h3>요약</h3>
+            <div class="box">
+              total: ${total}
+              accuracy_raw: ${accRaw.toFixed(4)}
+              accuracy_adj: <b>${accAdj.toFixed(4)}</b>
+              avg_ms(TTA총): ${avgMs.toFixed(2)}
+              median_ms(TTA총): ${medMs.toFixed(2)}
+              labels: ${JSON.stringify(labels)}
+              params: δ=${biasEgg}, T=${TEMP}, τ=${TAU}
+            </div>
+          `;
+
+          renderCM($("#cm"), labels, confAdj);
+          renderPerClass($("#perclass"), labels, perAdj);
+
+          // 파일 저장
+          const summary = {
+            framework: "tfjs-browser",
+            total,
+            accuracy_raw: accRaw,
+            accuracy_adj: accAdj,
+            avg_ms_total_tta: avgMs,
+            median_ms_total_tta: medMs,
+            labels,
+            confusion_raw: confRaw,
+            confusion_adj: confAdj,
+            perClass_adj: perAdj,
+            params: { biasEgg, TEMP, TAU },
+          };
+          downloadText(
+            "results_tfjs_adj.json",
+            JSON.stringify(summary, null, 2)
+          );
+          downloadText("preds_tfjs_adj_filtered.csv", csv);
+
+          log(
+            `[DONE] total=${total}, acc_raw=${accRaw.toFixed(
+              4
+            )}, acc_adj=${accAdj.toFixed(4)}, median_ms=${medMs.toFixed(
+              2
+            )}  → results_tfjs_adj.json, preds_tfjs_adj_filtered.csv 저장 완료`
+          );
+        } catch (e) {
+          console.error(e);
+          log("[ERR]", e.message || e);
+        }
+      };
+    </script>
+  </body>
+</html>
